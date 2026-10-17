@@ -1,0 +1,432 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { currentStreak, loadHistory, saveSession, type Session } from "@/lib/history";
+import { DIFFICULTY_LABELS, MODES, pickPrompt, type Mode, type Prompt } from "@/lib/prompts";
+import {
+  DEFAULT_SETTINGS,
+  PREP_OPTIONS,
+  SPEAK_OPTIONS,
+  formatSeconds,
+  loadSettings,
+  storeSettings,
+  type Settings,
+} from "@/lib/settings";
+import { useRecorder } from "@/lib/useRecorder";
+
+type Phase = "setup" | "ready" | "prep" | "speaking" | "review";
+
+interface Take {
+  url: string;
+  type: string;
+  seconds: number;
+}
+
+const SELF_CHECK = [
+  "I had a clear opening line",
+  "I stayed on the prompt",
+  "I gave at least one concrete example",
+  "I kept filler words (um, like, you know) low",
+  "I looked at the camera, not away",
+  "I finished with a strong closing line",
+];
+
+export default function Practice() {
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [history, setHistory] = useState<Session[]>([]);
+  const [phase, setPhase] = useState<Phase>("setup");
+  const [prompt, setPrompt] = useState<Prompt | null>(null);
+  const [prepLeft, setPrepLeft] = useState(0);
+  const [speakLeft, setSpeakLeft] = useState(0);
+  const [take, setTake] = useState<Take | null>(null);
+  const [checked, setChecked] = useState<boolean[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const { stream, error, openStream, closeStream, startRecording, stopRecording } = useRecorder();
+  const previewRef = useRef<HTMLVideoElement>(null);
+  const speakStartRef = useRef(0);
+
+  // Load per-browser settings and history after mount (localStorage isn't available on the server).
+  useEffect(() => {
+    setSettings(loadSettings());
+    setHistory(loadHistory());
+  }, []);
+
+  useEffect(() => {
+    if (previewRef.current) previewRef.current.srcObject = stream;
+  }, [stream, phase]);
+
+  // Release the previous take's object URL when it's replaced or on unmount.
+  useEffect(() => {
+    return () => {
+      if (take) URL.revokeObjectURL(take.url);
+    };
+  }, [take]);
+
+  function updateSettings(patch: Partial<Settings>) {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    storeSettings(next);
+  }
+
+  function toggleMode(mode: Mode) {
+    const has = settings.modes.includes(mode);
+    if (has && settings.modes.length === 1) return; // keep at least one
+    updateSettings({
+      modes: has ? settings.modes.filter((m) => m !== mode) : [...settings.modes, mode],
+    });
+  }
+
+  async function startSession() {
+    setBusy(true);
+    const ok = await openStream(settings.camera);
+    setBusy(false);
+    if (ok) setPhase("ready");
+  }
+
+  function endSession() {
+    void stopRecording();
+    closeStream();
+    setTake(null);
+    setPrompt(null);
+    setPhase("setup");
+  }
+
+  function beginPrep(next: Prompt) {
+    setPrompt(next);
+    setTake(null);
+    setChecked([]);
+    if (settings.prepSeconds === 0) {
+      beginSpeaking();
+    } else {
+      setPrepLeft(settings.prepSeconds);
+      setPhase("prep");
+    }
+  }
+
+  function revealPrompt() {
+    beginPrep(pickPrompt(settings, prompt?.id));
+  }
+
+  function beginSpeaking() {
+    if (!startRecording()) {
+      setPhase("ready");
+      return;
+    }
+    speakStartRef.current = Date.now();
+    setSpeakLeft(settings.speakSeconds);
+    setPhase("speaking");
+  }
+
+  async function finishSpeaking() {
+    if (phase !== "speaking") return;
+    setPhase("review");
+    const seconds = (Date.now() - speakStartRef.current) / 1000;
+    const blob = await stopRecording();
+    if (blob && blob.size > 0) {
+      setTake({ url: URL.createObjectURL(blob), type: blob.type, seconds });
+    }
+    if (prompt) {
+      setHistory(
+        saveSession({
+          promptId: prompt.id,
+          promptText: prompt.text,
+          mode: prompt.mode,
+          seconds: Math.round(seconds),
+          at: new Date().toISOString(),
+        }),
+      );
+    }
+  }
+
+  // Prep countdown.
+  useEffect(() => {
+    if (phase !== "prep") return;
+    if (prepLeft <= 0) {
+      beginSpeaking();
+      return;
+    }
+    const t = setTimeout(() => setPrepLeft((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, prepLeft]);
+
+  // Speaking countdown; auto-stops at the time limit.
+  useEffect(() => {
+    if (phase !== "speaking") return;
+    if (speakLeft <= 0) {
+      void finishSpeaking();
+      return;
+    }
+    const t = setTimeout(() => setSpeakLeft((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, speakLeft]);
+
+  const streak = currentStreak(history);
+  const hasVideo = !!stream && stream.getVideoTracks().length > 0;
+  const showStage = phase === "ready" || phase === "prep" || phase === "speaking";
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden>●</span> Speak Up
+        </div>
+        <div className="stats">
+          <span title="Days in a row with at least one take">🔥 {streak} day{streak === 1 ? "" : "s"}</span>
+          <span title="Total takes recorded">{history.length} take{history.length === 1 ? "" : "s"}</span>
+        </div>
+      </header>
+
+      {error && (
+        <div className="alert" role="alert">
+          {error}
+          {settings.camera && (
+            <button className="link" onClick={() => updateSettings({ camera: false })}>
+              Switch to audio only
+            </button>
+          )}
+        </div>
+      )}
+
+      {phase === "setup" && (
+        <section className="card">
+          <h1>Practise speaking on the spot</h1>
+          <p className="muted">
+            You get a random prompt, a short time to think, and then you speak to the camera until
+            the timer runs out. Watch the recording back and repeat.
+          </p>
+
+          <fieldset>
+            <legend>Prompt types</legend>
+            <div className="chips">
+              {(Object.keys(MODES) as Mode[]).map((m) => (
+                <button
+                  key={m}
+                  className={`chip ${settings.modes.includes(m) ? "on" : ""}`}
+                  aria-pressed={settings.modes.includes(m)}
+                  onClick={() => toggleMode(m)}
+                >
+                  {MODES[m].label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Difficulty</legend>
+            <div className="chips">
+              {(["any", 1, 2, 3] as const).map((d) => (
+                <button
+                  key={d}
+                  className={`chip ${settings.difficulty === d ? "on" : ""}`}
+                  aria-pressed={settings.difficulty === d}
+                  onClick={() => updateSettings({ difficulty: d })}
+                >
+                  {d === "any" ? "Mixed" : DIFFICULTY_LABELS[d]}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="row">
+            <fieldset>
+              <legend>Thinking time</legend>
+              <div className="chips">
+                {PREP_OPTIONS.map((s) => (
+                  <button
+                    key={s}
+                    className={`chip ${settings.prepSeconds === s ? "on" : ""}`}
+                    aria-pressed={settings.prepSeconds === s}
+                    onClick={() => updateSettings({ prepSeconds: s })}
+                  >
+                    {s === 0 ? "None" : formatSeconds(s)}
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>Speaking time</legend>
+              <div className="chips">
+                {SPEAK_OPTIONS.map((s) => (
+                  <button
+                    key={s}
+                    className={`chip ${settings.speakSeconds === s ? "on" : ""}`}
+                    aria-pressed={settings.speakSeconds === s}
+                    onClick={() => updateSettings({ speakSeconds: s })}
+                  >
+                    {formatSeconds(s)}
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+          </div>
+
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={settings.camera}
+              onChange={(e) => updateSettings({ camera: e.target.checked })}
+            />
+            Record video (turn off for audio only)
+          </label>
+
+          <button className="primary big" onClick={startSession} disabled={busy}>
+            {busy ? "Starting camera…" : "Start session"}
+          </button>
+
+          {history.length > 0 && (
+            <div className="history">
+              <h2>Recent takes</h2>
+              <ul>
+                {history.slice(0, 5).map((s) => (
+                  <li key={s.at}>
+                    <span className="tag">{MODES[s.mode].label}</span>
+                    <span className="history-text">{s.promptText}</span>
+                    <span className="muted">{formatSeconds(s.seconds)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+      )}
+
+      {showStage && (
+        <section className="card stage-card">
+          {prompt && phase !== "ready" && (
+            <div className="prompt">
+              <div className="prompt-meta">
+                <span className="tag">{MODES[prompt.mode].label}</span>
+                <span className="tag subtle">{DIFFICULTY_LABELS[prompt.difficulty]}</span>
+              </div>
+              <p className="prompt-text">{prompt.text}</p>
+              <p className="muted small">{MODES[prompt.mode].hint}</p>
+            </div>
+          )}
+
+          <div className={`stage ${phase === "speaking" ? "live" : ""}`}>
+            {hasVideo ? (
+              <video ref={previewRef} className="preview" autoPlay muted playsInline />
+            ) : (
+              <div className="preview audio-only">🎙️ Audio only</div>
+            )}
+
+            {phase === "prep" && (
+              <div className="overlay">
+                <div className="overlay-label">Think</div>
+                <div className="countdown">{prepLeft}</div>
+              </div>
+            )}
+            {phase === "speaking" && (
+              <>
+                <div className="rec-badge">● REC</div>
+                <div className="timer">{formatSeconds(speakLeft)}</div>
+                <div
+                  className="progress"
+                  style={{ width: `${(1 - speakLeft / settings.speakSeconds) * 100}%` }}
+                />
+              </>
+            )}
+          </div>
+
+          <div className="actions">
+            {phase === "ready" && (
+              <>
+                <button className="primary big" onClick={revealPrompt}>
+                  Reveal prompt{settings.prepSeconds > 0 ? ` (${formatSeconds(settings.prepSeconds)} to think)` : ""}
+                </button>
+                <button className="ghost" onClick={endSession}>
+                  End session
+                </button>
+              </>
+            )}
+            {phase === "prep" && (
+              <>
+                <button className="primary" onClick={beginSpeaking}>
+                  Start speaking now
+                </button>
+                <button className="ghost" onClick={revealPrompt}>
+                  Different prompt
+                </button>
+              </>
+            )}
+            {phase === "speaking" && (
+              <button className="danger" onClick={() => void finishSpeaking()}>
+                Stop
+              </button>
+            )}
+          </div>
+        </section>
+      )}
+
+      {phase === "review" && prompt && (
+        <section className="card">
+          <div className="prompt">
+            <div className="prompt-meta">
+              <span className="tag">{MODES[prompt.mode].label}</span>
+              {take && <span className="tag subtle">{formatSeconds(take.seconds)}</span>}
+            </div>
+            <p className="prompt-text">{prompt.text}</p>
+          </div>
+
+          {take ? (
+            take.type.startsWith("audio") ? (
+              <audio className="playback-audio" src={take.url} controls />
+            ) : (
+              <video className="playback" src={take.url} controls playsInline />
+            )
+          ) : (
+            <p className="muted">Saving your take…</p>
+          )}
+
+          <div className="self-check">
+            <h2>Watch it back, then check yourself</h2>
+            {SELF_CHECK.map((item, i) => (
+              <label key={item} className="check">
+                <input
+                  type="checkbox"
+                  checked={!!checked[i]}
+                  onChange={(e) => {
+                    const next = [...checked];
+                    next[i] = e.target.checked;
+                    setChecked(next);
+                  }}
+                />
+                {item}
+              </label>
+            ))}
+            <p className="muted small">
+              {checked.filter(Boolean).length}/{SELF_CHECK.length}. Doing a second take on the
+              same prompt is the fastest way to improve.
+            </p>
+          </div>
+
+          <div className="actions">
+            <button className="primary" onClick={() => beginPrep(prompt)}>
+              Try again, same prompt
+            </button>
+            <button className="secondary" onClick={revealPrompt}>
+              Next prompt
+            </button>
+            {take && (
+              <a
+                className="ghost"
+                href={take.url}
+                download={`speak-up-${new Date().toISOString().slice(0, 16).replace(/[T:]/g, "-")}.${
+                  take.type.includes("mp4") ? "mp4" : "webm"
+                }`}
+              >
+                Download
+              </a>
+            )}
+            <button className="ghost" onClick={endSession}>
+              End session
+            </button>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
