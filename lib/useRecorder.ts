@@ -30,13 +30,43 @@ function describeError(err: unknown): string {
   return "Couldn't start the camera or microphone.";
 }
 
-/** Camera/mic stream plus a MediaRecorder for one take at a time. */
+export interface Recording {
+  /** What the user watches back: video+audio, or audio only when the camera is off. */
+  media: Blob;
+  /** Small audio-only copy for transcription uploads (null if it couldn't be recorded). */
+  audio: Blob | null;
+}
+
+/** Records a stream into chunks; `stop()` resolves with the finished blob. */
+function startTrack(stream: MediaStream, mimeType: string | undefined, options: MediaRecorderOptions = {}) {
+  const recorder = new MediaRecorder(stream, mimeType ? { ...options, mimeType } : options);
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+  recorder.start(250);
+  const stop = (): Promise<Blob | null> => {
+    if (recorder.state === "inactive") return Promise.resolve(null);
+    return new Promise((resolve) => {
+      recorder.onstop = () => {
+        const type = recorder.mimeType || chunks[0]?.type || mimeType || "video/webm";
+        resolve(new Blob(chunks, { type }));
+      };
+      recorder.stop();
+    });
+  };
+  return { stop };
+}
+
+type Track = ReturnType<typeof startTrack>;
+
+/** Camera/mic stream plus MediaRecorders for one take at a time. */
 export function useRecorder() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const mediaRef = useRef<Track | null>(null);
+  const audioRef = useRef<Track | null>(null);
 
   const closeStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -75,33 +105,37 @@ export function useRecorder() {
   const startRecording = useCallback((): boolean => {
     const s = streamRef.current;
     if (!s) return false;
-    const mimeType = pickMimeType(s.getVideoTracks().length > 0);
+    const hasVideo = s.getVideoTracks().length > 0;
     try {
-      const recorder = new MediaRecorder(s, mimeType ? { mimeType } : undefined);
-      chunksRef.current = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-      recorder.start(250);
-      recorderRef.current = recorder;
-      return true;
+      mediaRef.current = startTrack(s, pickMimeType(hasVideo));
     } catch {
       setError("Recording isn't supported in this browser.");
       return false;
     }
+    // A low-bitrate audio-only copy keeps transcription uploads small (~0.4 MB/min).
+    audioRef.current = null;
+    if (hasVideo) {
+      try {
+        audioRef.current = startTrack(new MediaStream(s.getAudioTracks()), pickMimeType(false), {
+          audioBitsPerSecond: 48000,
+        });
+      } catch {
+        // Transcription upload will be skipped; playback still works.
+      }
+    }
+    return true;
   }, []);
 
-  const stopRecording = useCallback((): Promise<Blob | null> => {
-    const recorder = recorderRef.current;
-    recorderRef.current = null;
-    if (!recorder || recorder.state === "inactive") return Promise.resolve(null);
-    return new Promise((resolve) => {
-      recorder.onstop = () => {
-        const type = recorder.mimeType || chunksRef.current[0]?.type || "video/webm";
-        resolve(new Blob(chunksRef.current, { type }));
-      };
-      recorder.stop();
-    });
+  const stopRecording = useCallback(async (): Promise<Recording | null> => {
+    const media = mediaRef.current;
+    const audio = audioRef.current;
+    mediaRef.current = null;
+    audioRef.current = null;
+    if (!media) return null;
+    const [mediaBlob, audioBlob] = await Promise.all([media.stop(), audio ? audio.stop() : null]);
+    if (!mediaBlob) return null;
+    const audioOnly = mediaBlob.type.startsWith("audio");
+    return { media: mediaBlob, audio: audio ? audioBlob : audioOnly ? mediaBlob : null };
   }, []);
 
   useEffect(() => closeStream, [closeStream]);

@@ -1,10 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Feedback, { type Analysis } from "@/components/Feedback";
+import { analyze, tips as tipsFor } from "@/lib/analysis";
 import { currentStreak, loadHistory, saveSession, type Session } from "@/lib/history";
 import { DIFFICULTY_LABELS, MODES, pickPrompt, type Mode, type Prompt } from "@/lib/prompts";
 import {
   DEFAULT_SETTINGS,
+  LANGUAGES,
   PREP_OPTIONS,
   SPEAK_OPTIONS,
   formatSeconds,
@@ -12,7 +15,10 @@ import {
   storeSettings,
   type Settings,
 } from "@/lib/settings";
-import { useRecorder } from "@/lib/useRecorder";
+import { serverTranscriptionAvailable, transcribeOnServer } from "@/lib/transcribe";
+import type { Transcript } from "@/lib/transcript";
+import { useRecorder, type Recording } from "@/lib/useRecorder";
+import { speechRecognitionSupported, useSpeechRecognition } from "@/lib/useSpeechRecognition";
 
 type Phase = "setup" | "ready" | "prep" | "speaking" | "review";
 
@@ -41,15 +47,22 @@ export default function Practice() {
   const [take, setTake] = useState<Take | null>(null);
   const [checked, setChecked] = useState<boolean[]>([]);
   const [busy, setBusy] = useState(false);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [serverStt, setServerStt] = useState(false);
 
   const { stream, error, openStream, closeStream, startRecording, stopRecording } = useRecorder();
+  const speech = useSpeechRecognition();
   const previewRef = useRef<HTMLVideoElement>(null);
+  const playbackRef = useRef<HTMLVideoElement & HTMLAudioElement>(null);
   const speakStartRef = useRef(0);
+  // Bumped whenever a take starts or the session ends, so late transcription results are ignored.
+  const takeIdRef = useRef(0);
 
   // Load per-browser settings and history after mount (localStorage isn't available on the server).
   useEffect(() => {
     setSettings(loadSettings());
     setHistory(loadHistory());
+    void serverTranscriptionAvailable().then(setServerStt);
   }, []);
 
   useEffect(() => {
@@ -85,16 +98,21 @@ export default function Practice() {
   }
 
   function endSession() {
+    takeIdRef.current++;
     void stopRecording();
+    void speech.stop();
     closeStream();
     setTake(null);
+    setAnalysis(null);
     setPrompt(null);
     setPhase("setup");
   }
 
   function beginPrep(next: Prompt) {
+    takeIdRef.current++;
     setPrompt(next);
     setTake(null);
+    setAnalysis(null);
     setChecked([]);
     if (settings.prepSeconds === 0) {
       beginSpeaking();
@@ -113,30 +131,77 @@ export default function Practice() {
       setPhase("ready");
       return;
     }
+    // Without server transcription, transcribe live in the browser while recording.
+    if (!serverStt) speech.start(settings.language);
     speakStartRef.current = Date.now();
     setSpeakLeft(settings.speakSeconds);
     setPhase("speaking");
   }
 
+  async function runAnalysis(
+    recording: Recording | null,
+    browserTranscript: Transcript | null,
+    seconds: number,
+  ): Promise<Analysis> {
+    let transcript: Transcript;
+    if (serverStt) {
+      if (!recording?.audio) {
+        return { status: "unavailable", message: "Couldn't record a separate audio track to transcribe." };
+      }
+      try {
+        transcript = await transcribeOnServer(recording.audio, settings.language);
+      } catch (err) {
+        return { status: "unavailable", message: err instanceof Error ? err.message : "Transcription failed." };
+      }
+    } else if (browserTranscript) {
+      transcript = browserTranscript;
+    } else {
+      return {
+        status: "unavailable",
+        message: speechRecognitionSupported()
+          ? "Speech recognition didn't start, so there's no transcript for this take."
+          : "This browser can't transcribe speech. Use Chrome, Edge or Safari, or set up Deepgram (see README) to get transcripts in any browser.",
+      };
+    }
+    const stats = analyze(transcript, seconds);
+    return { status: "done", transcript, stats, tips: tipsFor(stats) };
+  }
+
   async function finishSpeaking() {
-    if (phase !== "speaking") return;
+    if (phase !== "speaking" || !prompt) return;
     setPhase("review");
+    const id = ++takeIdRef.current;
     const seconds = (Date.now() - speakStartRef.current) / 1000;
-    const blob = await stopRecording();
-    if (blob && blob.size > 0) {
-      setTake({ url: URL.createObjectURL(blob), type: blob.type, seconds });
+    const [recording, browserTranscript] = await Promise.all([stopRecording(), speech.stop()]);
+    if (id !== takeIdRef.current) return;
+    if (recording && recording.media.size > 0) {
+      setTake({ url: URL.createObjectURL(recording.media), type: recording.media.type, seconds });
     }
-    if (prompt) {
-      setHistory(
-        saveSession({
-          promptId: prompt.id,
-          promptText: prompt.text,
-          mode: prompt.mode,
-          seconds: Math.round(seconds),
-          at: new Date().toISOString(),
+    setAnalysis({ status: "working" });
+    const result = await runAnalysis(recording, browserTranscript, seconds);
+    // Record the take even if the user has already moved on.
+    setHistory(
+      saveSession({
+        promptId: prompt.id,
+        promptText: prompt.text,
+        mode: prompt.mode,
+        seconds: Math.round(seconds),
+        at: new Date().toISOString(),
+        ...(result.status === "done" && {
+          words: result.stats.words,
+          wpm: result.stats.wpm,
+          fillersPerMin: result.stats.fillersPerMin,
         }),
-      );
-    }
+      }),
+    );
+    if (id === takeIdRef.current) setAnalysis(result);
+  }
+
+  function seekTo(seconds: number) {
+    const el = playbackRef.current;
+    if (!el) return;
+    el.currentTime = Math.max(0, seconds - 0.3);
+    void el.play();
   }
 
   // Prep countdown.
@@ -263,6 +328,28 @@ export default function Practice() {
             </fieldset>
           </div>
 
+          <fieldset>
+            <legend>Your English</legend>
+            <div className="chips">
+              {LANGUAGES.map((l) => (
+                <button
+                  key={l.code}
+                  className={`chip ${settings.language === l.code ? "on" : ""}`}
+                  aria-pressed={settings.language === l.code}
+                  onClick={() => updateSettings({ language: l.code })}
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+            <p className="muted small hint">
+              Pick the accent closest to yours for a more accurate transcript.{" "}
+              {serverStt
+                ? "Transcripts come from Deepgram."
+                : "Transcripts come from your browser's speech recognition."}
+            </p>
+          </fieldset>
+
           <label className="toggle">
             <input
               type="checkbox"
@@ -284,6 +371,12 @@ export default function Practice() {
                   <li key={s.at}>
                     <span className="tag">{MODES[s.mode].label}</span>
                     <span className="history-text">{s.promptText}</span>
+                    {s.wpm != null && <span className="muted">{s.wpm} wpm</span>}
+                    {s.fillersPerMin != null && (
+                      <span className="muted" title="Fillers per minute">
+                        {s.fillersPerMin} f/m
+                      </span>
+                    )}
                     <span className="muted">{formatSeconds(s.seconds)}</span>
                   </li>
                 ))}
@@ -373,13 +466,15 @@ export default function Practice() {
 
           {take ? (
             take.type.startsWith("audio") ? (
-              <audio className="playback-audio" src={take.url} controls />
+              <audio ref={playbackRef} className="playback-audio" src={take.url} controls />
             ) : (
-              <video className="playback" src={take.url} controls playsInline />
+              <video ref={playbackRef} className="playback" src={take.url} controls playsInline />
             )
           ) : (
             <p className="muted">Saving your take…</p>
           )}
+
+          {analysis && <Feedback analysis={analysis} onSeek={take ? seekTo : undefined} />}
 
           <div className="self-check">
             <h2>Watch it back, then check yourself</h2>

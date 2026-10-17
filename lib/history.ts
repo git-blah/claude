@@ -6,6 +6,10 @@ export interface Session {
   mode: Prompt["mode"];
   seconds: number;
   at: string; // ISO timestamp
+  // Speech stats; absent when the take couldn't be transcribed.
+  words?: number;
+  wpm?: number | null;
+  fillersPerMin?: number | null;
 }
 
 const KEY = "speak-up:history";

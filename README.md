@@ -21,15 +21,48 @@ Open http://localhost:3000 and allow camera and microphone access. Browsers only
 4. **Speak:** recording starts automatically and stops when time runs out. You can also press *Stop*.
 5. **Review:** play the take back, tick the self-check list, download the video, then try the same prompt again or move to the next one.
 
-Settings and a history of your takes (prompt, length, date, used for the daily streak) are saved in your browser. Recordings are never uploaded. They exist only until you leave the page, unless you download them.
+After each take you get:
+
+- **Stats:** pace (words per minute, with 130–160 as the target), fillers (um/uh plus possible fillers like "like", "you know", "basically"), long pauses (2 seconds or more), time to your first word, and word count with vocabulary variety.
+- **Tips:** up to three concrete suggestions for your next take, based on those stats.
+- **Transcript:** what you said, with fillers highlighted and long pauses marked. With Deepgram, clicking a word jumps the video to that moment.
+
+Settings and a history of your takes (prompt, length, date, used for the daily streak) are saved in your browser. Video is never uploaded. It exists only until you leave the page, unless you download it. Speech is transcribed by your browser or, if you set it up, by Deepgram (see below).
+
+## Transcription
+
+There are two options. The app picks automatically.
+
+| | Browser (default) | Deepgram (recommended) |
+|---|---|---|
+| Setup | None | Add an API key |
+| Works in | Chrome, Edge, Safari | Any browser |
+| Filler words | Often drops "um"/"uh" | Keeps them (`filler_words=true`) |
+| Pauses and click-to-seek | No (no word timings) | Yes |
+| Privacy | Chrome sends audio to Google | Audio sent to Deepgram from your server |
+| Cost | Free | About $0.004/min ($200 free credit on sign-up) |
+
+To use Deepgram, create a key at https://console.deepgram.com and add it to `.env.local` (and to your host's environment variables when you deploy):
+
+```bash
+DEEPGRAM_API_KEY=your_key_here
+```
+
+Restart `npm run dev`. The setup screen will say "Transcripts come from Deepgram". Only a small audio-only copy of each take (about 0.4 MB/min) is uploaded, never the video. That also keeps uploads under the 4.5 MB request limit on Vercel.
+
+Known limitation: on Android Chrome, browser speech recognition can conflict with the camera's microphone. Use Deepgram there.
 
 ## Project layout
 
 ```
 app/                 Next.js App Router entry (layout, page, global styles)
 components/Practice.tsx  The whole practice flow (setup → ready → prep → speaking → review)
+components/Feedback.tsx  Stats tiles, tips and highlighted transcript
+app/api/transcribe/  Server route that forwards audio to Deepgram (needs DEEPGRAM_API_KEY)
 lib/prompts.ts       Prompt library (~100 prompts across 5 modes × 3 difficulties) + picker
-lib/useRecorder.ts   Camera/mic stream + MediaRecorder hook (video or audio-only)
+lib/analysis.ts      Pace, fillers, pauses, vocabulary and tips (unit tested: npm test)
+lib/useRecorder.ts   Camera/mic stream + MediaRecorder (video plus a small audio-only copy)
+lib/useSpeechRecognition.ts  Live browser transcription fallback
 lib/history.ts       Local take history and streak calculation
 lib/settings.ts      Settings defaults and persistence
 ```
@@ -38,7 +71,7 @@ To add prompts, add a `[difficulty, "text"]` entry under the right mode in `lib/
 
 ## Roadmap
 
-- **Phase 2: transcription and stats.** Send each take to a speech-to-text API (Whisper or Deepgram) and show words per minute, filler-word count and long pauses.
+- ~~Phase 2: transcription and stats~~ ✅
 - **Phase 3: AI coach and one-pager.** Send the prompt and transcript to Claude and get back structured feedback (scores, strengths, fixes, a stronger version of your answer) plus a one-page summary of the topic to learn from.
 - **Phase 4: progress.** Score trends over time, saved recordings and a weekly review.
 - **Later:** an audience mode (live follow-up questions), a comprehension mode (listen, then summarise), a debate mode (argue the other side) and an eye-contact check.
