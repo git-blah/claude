@@ -1,8 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { CoachPanel, OnePagerPanel, type Async } from "@/components/Coach";
 import Feedback, { type Analysis } from "@/components/Feedback";
 import { analyze, tips as tipsFor } from "@/lib/analysis";
+import { cacheOnePager, cachedOnePager, fetchProviders, requestFeedback, requestOnePager } from "@/lib/coach/client";
+import type { CoachFeedback, FeedbackRequest, OnePager, ProviderInfo } from "@/lib/coach/types";
 import { currentStreak, loadHistory, saveSession, type Session } from "@/lib/history";
 import { DIFFICULTY_LABELS, MODES, pickPrompt, type Mode, type Prompt } from "@/lib/prompts";
 import {
@@ -28,6 +31,15 @@ interface Take {
   seconds: number;
 }
 
+/** Words needed before AI coaching is worth asking for. */
+const MIN_COACH_WORDS = 15;
+
+function resolveCoach(settings: Settings, providers: ProviderInfo[]): ProviderInfo | null {
+  if (settings.coach === "off") return null;
+  const available = providers.filter((p) => p.available);
+  return available.find((p) => p.id === settings.coach) ?? available[0] ?? null;
+}
+
 const SELF_CHECK = [
   "I had a clear opening line",
   "I stayed on the prompt",
@@ -49,6 +61,10 @@ export default function Practice() {
   const [busy, setBusy] = useState(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [serverStt, setServerStt] = useState(false);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [coach, setCoach] = useState<Async<CoachFeedback> | null>(null);
+  const [onePager, setOnePager] = useState<Async<OnePager> | null>(null);
+  const coachRequestRef = useRef<FeedbackRequest | null>(null);
 
   const { stream, error, openStream, closeStream, startRecording, stopRecording } = useRecorder();
   const speech = useSpeechRecognition();
@@ -63,7 +79,15 @@ export default function Practice() {
     setSettings(loadSettings());
     setHistory(loadHistory());
     void serverTranscriptionAvailable().then(setServerStt);
+    void fetchProviders().then(setProviders);
   }, []);
+
+  const coachProvider = resolveCoach(settings, providers);
+  const coachModel =
+    coachProvider?.id === "ollama" && coachProvider.models?.includes(settings.ollamaModel)
+      ? settings.ollamaModel
+      : coachProvider?.model;
+  const coachSource = coachProvider ? `${coachProvider.label} · ${coachModel}` : "";
 
   useEffect(() => {
     if (previewRef.current) previewRef.current.srcObject = stream;
@@ -104,6 +128,8 @@ export default function Practice() {
     closeStream();
     setTake(null);
     setAnalysis(null);
+    setCoach(null);
+    setOnePager(null);
     setPrompt(null);
     setPhase("setup");
   }
@@ -113,6 +139,8 @@ export default function Practice() {
     setPrompt(next);
     setTake(null);
     setAnalysis(null);
+    setCoach(null);
+    setOnePager(null);
     setChecked([]);
     if (settings.prepSeconds === 0) {
       beginSpeaking();
@@ -194,7 +222,67 @@ export default function Practice() {
         }),
       }),
     );
-    if (id === takeIdRef.current) setAnalysis(result);
+    if (id !== takeIdRef.current) return;
+    setAnalysis(result);
+
+    if (result.status === "done" && coachProvider && result.stats.words >= MIN_COACH_WORDS) {
+      coachRequestRef.current = {
+        provider: coachProvider.id,
+        model: coachModel,
+        promptText: prompt.text,
+        mode: prompt.mode,
+        language: settings.language,
+        transcript: result.transcript.text,
+        seconds,
+        stats: {
+          wpm: result.stats.wpm,
+          fillersPerMin: result.stats.fillersPerMin,
+          longPauses: result.stats.longPauses,
+          startDelay: result.stats.startDelay,
+        },
+      };
+      runCoach();
+    }
+  }
+
+  function runCoach() {
+    const req = coachRequestRef.current;
+    if (!req) return;
+    const id = takeIdRef.current;
+    setCoach({ status: "working" });
+    requestFeedback(req).then(
+      (data) => id === takeIdRef.current && setCoach({ status: "done", data }),
+      (err: Error) => id === takeIdRef.current && setCoach({ status: "error", message: err.message }),
+    );
+  }
+
+  function loadOnePager() {
+    if (!coachProvider || !prompt) return;
+    const req = {
+      provider: coachProvider.id,
+      model: coachModel,
+      promptText: prompt.text,
+      mode: prompt.mode,
+      language: settings.language,
+    };
+    const cached = cachedOnePager(req);
+    if (cached) {
+      setOnePager({ status: "done", data: cached });
+      return;
+    }
+    const id = takeIdRef.current;
+    setOnePager({ status: "working" });
+    requestOnePager(req).then(
+      (data) => {
+        cacheOnePager(req, data);
+        if (id === takeIdRef.current) setOnePager({ status: "done", data });
+      },
+      (err: Error) => id === takeIdRef.current && setOnePager({ status: "error", message: err.message }),
+    );
+  }
+
+  function answerFollowUp(question: string) {
+    beginPrep({ id: `followup-${Date.now()}`, mode: "speech", difficulty: prompt?.difficulty ?? 2, text: question });
   }
 
   function seekTo(seconds: number) {
@@ -350,6 +438,53 @@ export default function Practice() {
             </p>
           </fieldset>
 
+          <fieldset>
+            <legend>AI coach</legend>
+            <div className="chips">
+              {providers.map((p) => (
+                <button
+                  key={p.id}
+                  className={`chip ${coachProvider?.id === p.id ? "on" : ""}`}
+                  aria-pressed={coachProvider?.id === p.id}
+                  disabled={!p.available}
+                  title={p.reason}
+                  onClick={() => updateSettings({ coach: p.id })}
+                >
+                  {p.label}
+                </button>
+              ))}
+              <button
+                className={`chip ${settings.coach === "off" ? "on" : ""}`}
+                aria-pressed={settings.coach === "off"}
+                onClick={() => updateSettings({ coach: "off" })}
+              >
+                Off
+              </button>
+            </div>
+            {coachProvider?.id === "ollama" && (coachProvider.models?.length ?? 0) > 1 && (
+              <label className="model-select small">
+                Model
+                <select
+                  value={coachModel}
+                  onChange={(e) => updateSettings({ ollamaModel: e.target.value })}
+                >
+                  {coachProvider.models?.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <p className="muted small hint">
+              {coachProvider
+                ? `After each take, ${coachProvider.label} (${coachModel})${coachProvider.id === "ollama" ? ", running on your computer," : ""} gives feedback and can write a one-pager on the topic.`
+                : settings.coach === "off"
+                  ? "AI coaching is off."
+                  : "Add an ANTHROPIC_API_KEY or run Ollama locally to get AI feedback and one-pagers (see README)."}
+            </p>
+          </fieldset>
+
           <label className="toggle">
             <input
               type="checkbox"
@@ -475,6 +610,19 @@ export default function Practice() {
           )}
 
           {analysis && <Feedback analysis={analysis} onSeek={take ? seekTo : undefined} />}
+
+          {coach && (
+            <CoachPanel state={coach} source={coachSource} onRetry={runCoach} onFollowUp={answerFollowUp} />
+          )}
+
+          {coachProvider &&
+            (onePager ? (
+              <OnePagerPanel state={onePager} source={coachSource} onRetry={loadOnePager} />
+            ) : (
+              <button className="secondary learn-btn" onClick={loadOnePager}>
+                Learn this topic: get a one-pager
+              </button>
+            ))}
 
           <div className="self-check">
             <h2>Watch it back, then check yourself</h2>

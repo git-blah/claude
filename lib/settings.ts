@@ -1,3 +1,4 @@
+import type { ProviderId } from "./coach/types";
 import type { Difficulty, Mode } from "./prompts";
 
 export interface Settings {
@@ -8,6 +9,10 @@ export interface Settings {
   camera: boolean;
   /** BCP-47 English variant used for speech recognition. */
   language: string;
+  /** AI coach provider; "auto" picks Claude if configured, else Ollama. */
+  coach: "auto" | ProviderId | "off";
+  /** Preferred Ollama model ("" = server default). */
+  ollamaModel: string;
 }
 
 /** English variants supported by both browser speech recognition and Deepgram nova-3. */
@@ -25,6 +30,8 @@ export const DEFAULT_SETTINGS: Settings = {
   speakSeconds: 60,
   camera: true,
   language: "en-US",
+  coach: "auto",
+  ollamaModel: "",
 };
 
 export const PREP_OPTIONS = [0, 15, 30, 60];
